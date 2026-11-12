@@ -1,0 +1,17 @@
+<configuration>
+  <include resource="org/springframework/boot/logging/logback/defaults.xml"/>
+  <springProfile name="dev | test">
+    <include resource="org/springframework/boot/logging/logback/console-appender.xml"/>
+    <root level="INFO"><appender-ref ref="CONSOLE"/></root>
+  </springProfile>
+  <springProfile name="!(dev | test)">
+    <appender name="JSON" class="ch.qos.logback.core.ConsoleAppender">
+      <encoder class="ch.qos.logback.core.encoder.LayoutWrappingEncoder">
+        <layout class="ch.qos.logback.classic.PatternLayout">
+          <pattern>{"ts":"%d{yyyy-MM-dd'T'HH:mm:ss.SSSXXX}","level":"%level","logger":"%logger","thread":"%thread","msg":"%replace(%replace(%msg){'\\','\\\\'}){'"','\\"'}"}%n</pattern>
+        </layout>
+      </encoder>
+    </appender>
+    <root level="INFO"><appender-ref ref="JSON"/></root>
+  </springProfile>
+</configuration>

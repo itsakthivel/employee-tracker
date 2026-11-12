@@ -1,0 +1,1142 @@
+openapi: 3.1.0
+info:
+  title: Employee Tracker API
+  version: 1.1.0
+  description: |
+    REST API for the Employee Tracker (specs/001-employee-tracker).
+
+    Authentication: a session cookie from POST /auth/login. Every mutating request
+    must send the CSRF token from the XSRF-TOKEN cookie in the X-XSRF-TOKEN header.
+    Sessions expire after 30 minutes of inactivity.
+
+    Roles:
+    - ADMIN: full access, including sensitive data (masked unless revealed).
+    - EMPLOYEE: company directory (directory view of active/on-leave employees),
+      own record (self view), and self-edit of phone and emergency contact.
+
+    While a user has mustChangePassword=true, every endpoint except /auth/me,
+    /auth/change-password and /auth/logout returns 403 with code PASSWORD_CHANGE_REQUIRED.
+
+    Errors use RFC 9457 Problem Details (application/problem+json) with a `code`.
+servers:
+  - url: /api/v1
+
+tags:
+  - name: Auth
+  - name: Self
+  - name: Employees
+  - name: Lifecycle
+  - name: Sensitive
+    description: ADMIN only. Every reveal and change is written to the sensitive access log.
+  - name: Reports
+  - name: Reference Data
+  - name: Users
+
+security:
+  - session: []
+
+paths:
+  # ───────────────────────────── Auth ─────────────────────────────
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Sign in (FR-003b, FR-003f)
+      description: |
+        Failure messages are the same whether or not the username exists. The 5th
+        consecutive failure locks the account for 15 minutes. Disabled accounts
+        (for example, terminated employees) cannot sign in.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username: { type: string, description: Work email }
+                password: { type: string, format: password }
+      responses:
+        '200':
+          description: Signed in
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CurrentUser' }
+        '401':
+          description: |
+            Invalid credentials, a locked account or a disabled account. All three return the
+            same body (code UNAUTHORIZED, "Invalid username or password"), so the response never
+            reveals whether an account exists or is locked.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /auth/logout:
+    post:
+      tags: [Auth]
+      summary: End the current session
+      responses:
+        '204': { description: Signed out }
+
+  /auth/me:
+    get:
+      tags: [Auth]
+      summary: Current user, role and password-change flag
+      responses:
+        '200':
+          description: Current user
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CurrentUser' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /auth/change-password:
+    post:
+      tags: [Auth]
+      summary: Change own password, including the required first-sign-in change (FR-003c, FR-003d)
+      description: Ends all of the user's other sessions.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [currentPassword, newPassword]
+              properties:
+                currentPassword: { type: string, format: password }
+                newPassword: { $ref: '#/components/schemas/NewPassword' }
+      responses:
+        '204': { description: Changed }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /auth/password-reset:
+    post:
+      tags: [Auth]
+      summary: Request a password-reset email (FR-003e)
+      description: Always returns 202, so the response doesn't reveal whether the account exists. The emailed link is single-use and expires after 1 hour.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username]
+              properties:
+                username: { type: string }
+      responses:
+        '202': { description: Accepted }
+
+  /auth/password-reset/confirm:
+    post:
+      tags: [Auth]
+      summary: Set a new password using a reset token (FR-003e)
+      description: Clears any lockout and the must-change flag, and ends all of the user's sessions.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token, newPassword]
+              properties:
+                token: { type: string }
+                newPassword: { $ref: '#/components/schemas/NewPassword' }
+      responses:
+        '204': { description: Password set }
+        '400':
+          description: Token invalid, expired or already used (code RESET_TOKEN_INVALID), or the password failed the rules
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/ValidationProblem' }
+
+  # ───────────────────────────── Self ─────────────────────────────
+  /me/profile:
+    get:
+      tags: [Self]
+      summary: Own employee record (self view)
+      responses:
+        '200':
+          description: Self view
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EmployeeDetail' }
+        '404':
+          description: The account is not linked to an employee (an admin-only account)
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+    patch:
+      tags: [Self]
+      summary: Update own phone and emergency contact (FR-003)
+      description: Any other field in the body is rejected with 400. Recorded in history as SELF_UPDATED.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [version]
+              additionalProperties: false
+              properties:
+                version: { type: integer }
+                phone: { type: [string, 'null'] }
+                emergencyContact: { $ref: '#/components/schemas/EmergencyContactInput' }
+      responses:
+        '200':
+          description: Updated self view
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EmployeeDetail' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  # ─────────────────────────── Employees ──────────────────────────
+  /employees:
+    get:
+      tags: [Employees]
+      summary: Directory / employee list with search, filter and sort (FR-013, FR-016–FR-018)
+      description: |
+        ADMIN sees all employees. EMPLOYEE sees only ACTIVE and ON_LEAVE employees,
+        `includeTerminated` is ignored, and `status` accepts only ACTIVE/ON_LEAVE.
+        Each item is shaped by the caller's view (see EmployeeSummary.view).
+      parameters:
+        - $ref: '#/components/parameters/q'
+        - $ref: '#/components/parameters/departmentId'
+        - $ref: '#/components/parameters/locationId'
+        - $ref: '#/components/parameters/managerId'
+        - $ref: '#/components/parameters/status'
+        - $ref: '#/components/parameters/employmentType'
+        - $ref: '#/components/parameters/includeTerminated'
+        - name: sort
+          in: query
+          schema:
+            type: string
+            enum: [fullName, -fullName, department, -department, startDate, -startDate, status, -status]
+            default: fullName
+          description: startDate and status sorts are ADMIN-only. EMPLOYEE gets 400.
+        - { name: page, in: query, schema: { type: integer, minimum: 0, default: 0 } }
+        - { name: size, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 25 } }
+      responses:
+        '200':
+          description: One page
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EmployeePage' }
+    post:
+      tags: [Employees]
+      summary: Create an employee (ADMIN) (FR-004, FR-005, FR-007)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EmployeeCreate' }
+      responses:
+        '201':
+          description: Created (admin view)
+          headers:
+            Location: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EmployeeDetail' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /employees/{id}:
+    parameters: [{ $ref: '#/components/parameters/employeeId' }]
+    get:
+      tags: [Employees]
+      summary: Employee profile (FR-019)
+      description: Returns the admin, self or directory view depending on the caller. A non-admin requesting a TERMINATED employee gets 404.
+      responses:
+        '200':
+          description: Profile
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EmployeeDetail' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Employees]
+      summary: Update employee details (ADMIN) (FR-008, FR-010)
+      description: Partial update. `version` is required. Status uses the lifecycle endpoints, and sensitive data uses /sensitive and /compensation.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EmployeeUpdate' }
+      responses:
+        '200':
+          description: Updated (admin view)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EmployeeDetail' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/RuleViolation' }
+
+  /employees/{id}/history:
+    parameters: [{ $ref: '#/components/parameters/employeeId' }]
+    get:
+      tags: [Employees]
+      summary: Change history, newest first (FR-009)
+      description: ADMIN sees any employee's history. EMPLOYEE sees only their own record, limited to self-view fields. Anything else returns 404.
+      parameters:
+        - { name: page, in: query, schema: { type: integer, minimum: 0, default: 0 } }
+        - { name: size, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 50 } }
+      responses:
+        '200':
+          description: History
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, totalItems]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/ChangeEntry' } }
+                  totalItems: { type: integer }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ─────────────────────────── Lifecycle ──────────────────────────
+  /employees/{id}/status:
+    parameters: [{ $ref: '#/components/parameters/employeeId' }]
+    post:
+      tags: [Lifecycle]
+      summary: Change status (ADMIN) (FR-012, FR-014, FR-003a)
+      description: Changing to TERMINATED disables the linked sign-in and ends its sessions.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/StatusChange' }
+      responses:
+        '200':
+          description: Status changed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EmployeeDetail' }
+        '409':
+          description: Stale version (STALE_VERSION), or direct reports not acknowledged (DIRECT_REPORTS)
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/DirectReportsProblem' }
+        '422': { $ref: '#/components/responses/RuleViolation' }
+
+  /employees/{id}/reactivate:
+    parameters: [{ $ref: '#/components/parameters/employeeId' }]
+    post:
+      tags: [Lifecycle]
+      summary: Rehire a terminated employee (ADMIN) (FR-015)
+      description: Re-enables the linked sign-in with mustChangePassword=true.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [version, startDate]
+              properties:
+                version: { type: integer }
+                startDate: { type: string, format: date }
+                jobTitle: { type: string }
+                departmentId: { type: string, format: uuid }
+                managerId: { type: [string, 'null'], format: uuid }
+      responses:
+        '200':
+          description: Reactivated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EmployeeDetail' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/RuleViolation' }
+
+  # ─────────────────────────── Sensitive ──────────────────────────
+  /employees/{id}/sensitive:
+    parameters: [{ $ref: '#/components/parameters/employeeId' }]
+    get:
+      tags: [Sensitive]
+      summary: Masked sensitive data (ADMIN) (FR-006b, FR-006c)
+      responses:
+        '200':
+          description: Masked values; null when not recorded
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SensitiveMasked' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    put:
+      tags: [Sensitive]
+      summary: Create or replace government ID, tax ID and bank details (ADMIN) (FR-006a)
+      description: Logs CREATE/UPDATE per changed field. History stores masked values only.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SensitiveInput' }
+      responses:
+        '200':
+          description: Saved (masked)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SensitiveMasked' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /employees/{id}/sensitive/reveal:
+    parameters: [{ $ref: '#/components/parameters/employeeId' }]
+    post:
+      tags: [Sensitive]
+      summary: Reveal one full sensitive value (ADMIN) (FR-006c, FR-006d)
+      description: Writes a REVEAL entry to the access log. The response is sent with Cache-Control no-store.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [field]
+              properties:
+                field:
+                  type: string
+                  enum: [govIdNumber, taxId, bankAccountHolder, bankAccountNumber, bankRoutingCode]
+      responses:
+        '200':
+          description: Full value
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [field, value]
+                properties:
+                  field: { type: string }
+                  value: { type: [string, 'null'] }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /employees/{id}/compensation:
+    parameters: [{ $ref: '#/components/parameters/employeeId' }]
+    get:
+      tags: [Sensitive]
+      summary: Compensation history, newest effective date first (ADMIN) (FR-006e)
+      description: Viewing the list writes a REVEAL entry for the compensation field. Cache-Control is no-store.
+      responses:
+        '200':
+          description: Compensation records
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  current: { anyOf: [{ $ref: '#/components/schemas/Compensation' }, { type: 'null' }] }
+                  items: { type: array, items: { $ref: '#/components/schemas/Compensation' } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Sensitive]
+      summary: Add a compensation record (ADMIN)
+      description: Records are append-only, so a correction is entered as a new record. Logs CREATE.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CompensationInput' }
+      responses:
+        '201':
+          description: Added
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Compensation' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '409':
+          description: A record already exists for this effective date (DUPLICATE_EFFECTIVE_DATE)
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /sensitive-access-log:
+    get:
+      tags: [Sensitive]
+      summary: Sensitive data access log (ADMIN) (FR-006d, SC-008)
+      parameters:
+        - { name: employeeId, in: query, schema: { type: string, format: uuid } }
+        - { name: actorId, in: query, schema: { type: string, format: uuid } }
+        - { name: from, in: query, schema: { type: string, format: date-time } }
+        - { name: to, in: query, schema: { type: string, format: date-time } }
+        - { name: page, in: query, schema: { type: integer, minimum: 0, default: 0 } }
+        - { name: size, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 50 } }
+      responses:
+        '200':
+          description: Log entries, newest first
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, totalItems]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/AccessLogEntry' } }
+                  totalItems: { type: integer }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ──────────────────────────── Reports ───────────────────────────
+  /reports/headcount:
+    get:
+      tags: [Reports]
+      summary: Headcount breakdown (ADMIN) (FR-020)
+      responses:
+        '200':
+          description: Headcount
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Headcount' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /employees/export:
+    get:
+      tags: [Reports]
+      summary: Export the filtered list as CSV (ADMIN) (FR-021)
+      description: Takes the same filters as GET /employees. Never includes sensitive data. Notes and personal fields are included.
+      parameters:
+        - $ref: '#/components/parameters/q'
+        - $ref: '#/components/parameters/departmentId'
+        - $ref: '#/components/parameters/locationId'
+        - $ref: '#/components/parameters/managerId'
+        - $ref: '#/components/parameters/status'
+        - $ref: '#/components/parameters/employmentType'
+        - $ref: '#/components/parameters/includeTerminated'
+      responses:
+        '200':
+          description: CSV file
+          headers:
+            Content-Disposition:
+              schema: { type: string, example: 'attachment; filename="employees-2026-11-12.csv"' }
+          content:
+            text/csv:
+              schema: { type: string }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ───────────────────────── Reference data ───────────────────────
+  /departments:
+    get:
+      tags: [Reference Data]
+      summary: List departments (any signed-in user)
+      responses:
+        '200':
+          description: Departments
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Department' } }
+    post:
+      tags: [Reference Data]
+      summary: Create a department (ADMIN) (FR-022)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DepartmentInput' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Department' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /departments/{id}:
+    parameters: [{ name: id, in: path, required: true, schema: { type: string, format: uuid } }]
+    put:
+      tags: [Reference Data]
+      summary: Rename a department or set its head (ADMIN)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DepartmentInput' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Department' }
+        '409': { $ref: '#/components/responses/Conflict' }
+    delete:
+      tags: [Reference Data]
+      summary: Delete an unused department (ADMIN) (FR-023)
+      responses:
+        '204': { description: Deleted }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /locations:
+    get:
+      tags: [Reference Data]
+      summary: List locations (any signed-in user)
+      responses:
+        '200':
+          description: Locations
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Location' } }
+    post:
+      tags: [Reference Data]
+      summary: Create a location (ADMIN)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LocationInput' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Location' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /locations/{id}:
+    parameters: [{ name: id, in: path, required: true, schema: { type: string, format: uuid } }]
+    put:
+      tags: [Reference Data]
+      summary: Rename a location (ADMIN)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LocationInput' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Location' }
+        '409': { $ref: '#/components/responses/Conflict' }
+    delete:
+      tags: [Reference Data]
+      summary: Delete an unused location (ADMIN) (FR-023)
+      responses:
+        '204': { description: Deleted }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  # ───────────────────────────── Users ────────────────────────────
+  /users:
+    get:
+      tags: [Users]
+      summary: List sign-in accounts (ADMIN)
+      parameters:
+        - { name: q, in: query, schema: { type: string } }
+        - { name: role, in: query, schema: { $ref: '#/components/schemas/Role' } }
+        - { name: enabled, in: query, schema: { type: boolean } }
+      responses:
+        '200':
+          description: Users
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/UserAccount' } }
+    post:
+      tags: [Users]
+      summary: Create a sign-in for an employee (ADMIN) (FR-003c)
+      description: The username is the employee's work email. The account starts with mustChangePassword=true.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [employeeId, role, temporaryPassword]
+              properties:
+                employeeId: { type: string, format: uuid }
+                role: { $ref: '#/components/schemas/Role' }
+                temporaryPassword: { $ref: '#/components/schemas/NewPassword' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserAccount' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '409':
+          description: The employee already has an account (ACCOUNT_EXISTS) or is terminated (EMPLOYEE_TERMINATED)
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /users/{id}:
+    parameters: [{ name: id, in: path, required: true, schema: { type: string, format: uuid } }]
+    patch:
+      tags: [Users]
+      summary: Change role or enabled flag (ADMIN)
+      description: Disabling ends all of the account's sessions. Admins cannot disable or demote themselves (SELF_LOCKOUT), and the last enabled ADMIN cannot be disabled or demoted (LAST_ADMIN).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                role: { $ref: '#/components/schemas/Role' }
+                enabled: { type: boolean }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserAccount' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /users/{id}/temporary-password:
+    parameters: [{ name: id, in: path, required: true, schema: { type: string, format: uuid } }]
+    post:
+      tags: [Users]
+      summary: Issue a new temporary password (ADMIN) (FR-003e)
+      description: Sets mustChangePassword=true, clears lockout and ends the user's sessions.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [temporaryPassword]
+              properties:
+                temporaryPassword: { $ref: '#/components/schemas/NewPassword' }
+      responses:
+        '204': { description: Issued }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+
+components:
+  securitySchemes:
+    session:
+      type: apiKey
+      in: cookie
+      name: SESSION
+
+  parameters:
+    employeeId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    q:
+      name: q
+      in: query
+      description: Case-insensitive partial match on full name, work email, and (ADMIN only) employee number
+      schema: { type: string, maxLength: 100 }
+    departmentId:
+      name: departmentId
+      in: query
+      schema: { type: array, items: { type: string, format: uuid } }
+      style: form
+      explode: true
+    locationId:
+      name: locationId
+      in: query
+      schema: { type: array, items: { type: string, format: uuid } }
+      style: form
+      explode: true
+    managerId:
+      name: managerId
+      in: query
+      schema: { type: string, format: uuid }
+    status:
+      name: status
+      in: query
+      schema: { type: array, items: { $ref: '#/components/schemas/EmploymentStatus' } }
+      style: form
+      explode: true
+    employmentType:
+      name: employmentType
+      in: query
+      description: ADMIN only. Ignored for EMPLOYEE.
+      schema: { type: array, items: { $ref: '#/components/schemas/EmploymentType' } }
+      style: form
+      explode: true
+    includeTerminated:
+      name: includeTerminated
+      in: query
+      description: ADMIN only; ignored if `status` is given
+      schema: { type: boolean, default: false }
+
+  responses:
+    Unauthorized:
+      description: Not signed in or session expired
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Forbidden:
+      description: Role not allowed, or password change required (PASSWORD_CHANGE_REQUIRED)
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    NotFound:
+      description: Not found, or not visible to the caller
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    ValidationFailed:
+      description: One or more fields are invalid
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/ValidationProblem' }
+    Conflict:
+      description: Duplicate value, stale version (STALE_VERSION), or record in use (IN_USE)
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    RuleViolation:
+      description: Business rule violated (REPORTING_CYCLE, INVALID_TRANSITION, END_BEFORE_START)
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+  schemas:
+    Role:
+      type: string
+      enum: [ADMIN, EMPLOYEE]
+    EmploymentStatus:
+      type: string
+      enum: [ACTIVE, ON_LEAVE, TERMINATED]
+    EmploymentType:
+      type: string
+      enum: [FULL_TIME, PART_TIME, CONTRACTOR, INTERN]
+    View:
+      type: string
+      enum: [DIRECTORY, SELF, ADMIN]
+      description: Which field set this response contains (research §4)
+
+    NewPassword:
+      type: string
+      format: password
+      minLength: 12
+      maxLength: 128
+      description: Must not be on the common-password list
+
+    CurrentUser:
+      type: object
+      required: [id, username, role, mustChangePassword]
+      properties:
+        id: { type: string, format: uuid }
+        username: { type: string }
+        role: { $ref: '#/components/schemas/Role' }
+        employeeId: { type: [string, 'null'], format: uuid }
+        mustChangePassword: { type: boolean }
+
+    Ref:
+      type: object
+      required: [id, name]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+
+    EmployeeSummary:
+      description: |
+        A list item. DIRECTORY view includes only the required fields. ADMIN view adds
+        employeeNumber, status, employmentType, startDate, endDate and isPreHire.
+      type: object
+      required: [id, view, fullName, workEmail, jobTitle, department]
+      properties:
+        id: { type: string, format: uuid }
+        view: { $ref: '#/components/schemas/View' }
+        fullName: { type: string }
+        workEmail: { type: string, format: email }
+        phone: { type: [string, 'null'] }
+        jobTitle: { type: string }
+        department: { $ref: '#/components/schemas/Ref' }
+        location: { anyOf: [{ $ref: '#/components/schemas/Ref' }, { type: 'null' }] }
+        manager: { anyOf: [{ $ref: '#/components/schemas/Ref' }, { type: 'null' }] }
+        employeeNumber: { type: string }
+        status: { $ref: '#/components/schemas/EmploymentStatus' }
+        employmentType: { $ref: '#/components/schemas/EmploymentType' }
+        startDate: { type: string, format: date }
+        endDate: { type: [string, 'null'], format: date }
+        isPreHire: { type: boolean }
+
+    EmployeeDetail:
+      description: |
+        Profile. The fields present depend on `view`:
+        - DIRECTORY: EmployeeSummary directory fields + directReports.
+        - SELF: + employeeNumber, employmentType, status, startDate, dateOfBirth, homeAddress, emergencyContact, version.
+        - ADMIN: every field below. Sensitive data is never included here; use /sensitive.
+        (Flattened rather than allOf so contract tests can check it strictly.)
+      type: object
+      required: [id, view, fullName, workEmail, jobTitle, department, directReports]
+      properties:
+        id: { type: string, format: uuid }
+        view: { $ref: '#/components/schemas/View' }
+        fullName: { type: string }
+        workEmail: { type: string, format: email }
+        phone: { type: [string, 'null'] }
+        jobTitle: { type: string }
+        department: { $ref: '#/components/schemas/Ref' }
+        location: { anyOf: [{ $ref: '#/components/schemas/Ref' }, { type: 'null' }] }
+        manager: { anyOf: [{ $ref: '#/components/schemas/Ref' }, { type: 'null' }] }
+        employeeNumber: { type: string }
+        status: { $ref: '#/components/schemas/EmploymentStatus' }
+        employmentType: { $ref: '#/components/schemas/EmploymentType' }
+        startDate: { type: string, format: date }
+        endDate: { type: [string, 'null'], format: date }
+        isPreHire: { type: boolean }
+
+        directReports: { type: array, items: { $ref: '#/components/schemas/Ref' } }
+        version: { type: integer }
+        dateOfBirth: { type: [string, 'null'], format: date }
+        homeAddress: { type: [string, 'null'] }
+        emergencyContact:
+          anyOf:
+            - type: 'null'
+            - type: object
+              properties:
+                name: { type: [string, 'null'] }
+                relationship: { type: [string, 'null'] }
+                phone: { type: [string, 'null'] }
+        notes: { type: [string, 'null'], description: ADMIN view only }
+
+    EmployeePage:
+      type: object
+      required: [items, page, size, totalItems, totalPages]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/EmployeeSummary' } }
+        page: { type: integer }
+        size: { type: integer }
+        totalItems: { type: integer }
+        totalPages: { type: integer }
+
+    EmergencyContactInput:
+      anyOf:
+        - type: 'null'
+        - type: object
+          properties:
+            name: { type: string, maxLength: 150 }
+            relationship: { type: string, maxLength: 50 }
+            phone: { type: string }
+
+    EmployeeCreate:
+      type: object
+      required: [employeeNumber, fullName, workEmail, jobTitle, departmentId, employmentType, status, startDate]
+      properties:
+        employeeNumber: { type: string, pattern: '^[A-Za-z0-9-]{1,20}$' }
+        fullName: { type: string, minLength: 1, maxLength: 150 }
+        workEmail: { type: string, format: email }
+        phone: { type: string }
+        jobTitle: { type: string, minLength: 1, maxLength: 100 }
+        departmentId: { type: string, format: uuid }
+        locationId: { type: string, format: uuid }
+        managerId: { type: string, format: uuid }
+        employmentType: { $ref: '#/components/schemas/EmploymentType' }
+        status: { type: string, enum: [ACTIVE, ON_LEAVE] }
+        startDate: { type: string, format: date }
+        dateOfBirth: { type: string, format: date }
+        homeAddress: { type: string, maxLength: 500 }
+        emergencyContact: { $ref: '#/components/schemas/EmergencyContactInput' }
+        notes: { type: string, maxLength: 2000 }
+
+    EmployeeUpdate:
+      description: Any EmployeeCreate field except status. Send null to clear an optional field.
+      type: object
+      required: [version]
+      properties:
+        version: { type: integer }
+        employeeNumber: { type: string }
+        fullName: { type: string }
+        workEmail: { type: string, format: email }
+        phone: { type: [string, 'null'] }
+        jobTitle: { type: string }
+        departmentId: { type: string, format: uuid }
+        locationId: { type: [string, 'null'], format: uuid }
+        managerId: { type: [string, 'null'], format: uuid }
+        employmentType: { $ref: '#/components/schemas/EmploymentType' }
+        startDate: { type: string, format: date }
+        dateOfBirth: { type: [string, 'null'], format: date }
+        homeAddress: { type: [string, 'null'] }
+        emergencyContact: { $ref: '#/components/schemas/EmergencyContactInput' }
+        notes: { type: [string, 'null'] }
+
+    StatusChange:
+      type: object
+      required: [version, status]
+      properties:
+        version: { type: integer }
+        status: { $ref: '#/components/schemas/EmploymentStatus' }
+        endDate: { type: string, format: date, description: Required for TERMINATED }
+        acknowledgeDirectReports: { type: boolean, default: false }
+
+    ChangeEntry:
+      type: object
+      required: [id, changeType, changedBy, changedAt]
+      properties:
+        id: { type: string, format: uuid }
+        changeType: { type: string, enum: [CREATED, UPDATED, STATUS_CHANGED, REACTIVATED, SELF_UPDATED] }
+        fieldName: { type: [string, 'null'] }
+        oldValue: { type: [string, 'null'], description: Masked for sensitive fields }
+        newValue: { type: [string, 'null'], description: Masked for sensitive fields }
+        changedBy: { $ref: '#/components/schemas/Ref' }
+        changedAt: { type: string, format: date-time }
+
+    SensitiveMasked:
+      type: object
+      required: [version]
+      properties:
+        version: { type: integer }
+        govIdType: { type: [string, 'null'] }
+        govIdNumber: { type: [string, 'null'], examples: ['••••4821'] }
+        taxId: { type: [string, 'null'], examples: ['••••90AB'] }
+        bankAccountHolder: { type: [string, 'null'], description: '"••••" when set; use reveal' }
+        bankName: { type: [string, 'null'] }
+        bankAccountNumber: { type: [string, 'null'], examples: ['••••1234'] }
+        bankRoutingCode: { type: [string, 'null'], examples: ['••••0042'] }
+
+    SensitiveInput:
+      description: Full replacement. Omitted or null fields are cleared. Send the `version` from the last GET (0 when nothing is recorded yet).
+      type: object
+      required: [version]
+      properties:
+        version: { type: integer }
+        govIdType: { type: [string, 'null'], maxLength: 50 }
+        govIdNumber: { type: [string, 'null'], pattern: '^[A-Za-z0-9-]{4,30}$' }
+        taxId: { type: [string, 'null'], minLength: 4, maxLength: 30 }
+        bankAccountHolder: { type: [string, 'null'], maxLength: 150 }
+        bankName: { type: [string, 'null'], maxLength: 150 }
+        bankAccountNumber: { type: [string, 'null'], minLength: 4, maxLength: 34 }
+        bankRoutingCode: { type: [string, 'null'], maxLength: 20 }
+
+    Compensation:
+      type: object
+      required: [id, amount, currency, payFrequency, effectiveDate, createdBy, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        amount: { type: string, description: Decimal as string, e.g. "85000.00" }
+        currency: { type: string, pattern: '^[A-Z]{3}$' }
+        payFrequency: { type: string, enum: [ANNUAL, MONTHLY, HOURLY] }
+        effectiveDate: { type: string, format: date }
+        reason: { type: [string, 'null'] }
+        createdBy: { $ref: '#/components/schemas/Ref' }
+        createdAt: { type: string, format: date-time }
+
+    CompensationInput:
+      type: object
+      required: [amount, currency, payFrequency, effectiveDate]
+      properties:
+        amount: { type: string, pattern: '^\d{1,12}(\.\d{1,2})?$' }
+        currency: { type: string, pattern: '^[A-Z]{3}$' }
+        payFrequency: { type: string, enum: [ANNUAL, MONTHLY, HOURLY] }
+        effectiveDate: { type: string, format: date }
+        reason: { type: string, maxLength: 200 }
+
+    AccessLogEntry:
+      type: object
+      required: [id, actor, employee, field, action, occurredAt]
+      properties:
+        id: { type: string, format: uuid }
+        actor: { $ref: '#/components/schemas/Ref' }
+        employee: { $ref: '#/components/schemas/Ref' }
+        field: { type: string, enum: [govIdType, govIdNumber, taxId, bankAccountHolder, bankName, bankAccountNumber, bankRoutingCode, compensation] }
+        action: { type: string, enum: [REVEAL, CREATE, UPDATE] }
+        occurredAt: { type: string, format: date-time }
+
+    Headcount:
+      type: object
+      required: [totalActive, byDepartment, byStatus, byEmploymentType]
+      properties:
+        totalActive: { type: integer, description: ACTIVE + ON_LEAVE }
+        byDepartment:
+          type: array
+          items:
+            type: object
+            required: [department, count]
+            properties:
+              department: { $ref: '#/components/schemas/Ref' }
+              count: { type: integer }
+        byStatus: { type: object, additionalProperties: { type: integer } }
+        byEmploymentType: { type: object, additionalProperties: { type: integer } }
+
+    Department:
+      type: object
+      required: [id, name]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        head: { anyOf: [{ $ref: '#/components/schemas/Ref' }, { type: 'null' }] }
+        employeeCount: { type: integer, description: ADMIN only }
+    DepartmentInput:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 100 }
+        headEmployeeId: { type: [string, 'null'], format: uuid }
+
+    Location:
+      type: object
+      required: [id, name]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        employeeCount: { type: integer, description: ADMIN only }
+    LocationInput:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 100 }
+
+    UserAccount:
+      type: object
+      required: [id, username, role, enabled, mustChangePassword, locked]
+      properties:
+        id: { type: string, format: uuid }
+        username: { type: string }
+        role: { $ref: '#/components/schemas/Role' }
+        employee: { anyOf: [{ $ref: '#/components/schemas/Ref' }, { type: 'null' }] }
+        enabled: { type: boolean }
+        mustChangePassword: { type: boolean }
+        locked: { type: boolean }
+        lastLoginAt: { type: [string, 'null'], format: date-time }
+
+    Problem:
+      type: object
+      required: [type, title, status]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        employeeCount:
+          type: integer
+          description: With IN_USE, how many employees still reference the record
+        code:
+          type: string
+          description: |
+            e.g. DUPLICATE_EMPLOYEE_NUMBER, DUPLICATE_EMAIL, STALE_VERSION, REPORTING_CYCLE,
+            INVALID_TRANSITION, END_BEFORE_START, DIRECT_REPORTS, IN_USE, ACCOUNT_LOCKED,
+            PASSWORD_CHANGE_REQUIRED, RESET_TOKEN_INVALID, ACCOUNT_EXISTS, EMPLOYEE_TERMINATED,
+            SELF_LOCKOUT, LAST_ADMIN, DUPLICATE_EFFECTIVE_DATE, DUPLICATE_NAME,
+            SENSITIVE_DATA_UNAVAILABLE, VALIDATION_FAILED, UNAUTHORIZED, FORBIDDEN, NOT_FOUND
+    ValidationProblem:
+      description: Problem with per-field errors (flattened Problem).
+      type: object
+      required: [type, title, status, fieldErrors]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        code: { type: string }
+        fieldErrors:
+          type: array
+          items:
+            type: object
+            required: [field, message]
+            properties:
+              field: { type: string }
+              message: { type: string }
+    DirectReportsProblem:
+      description: Problem listing direct reports (flattened Problem).
+      type: object
+      required: [type, title, status]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        code: { type: string }
+        directReports: { type: array, items: { $ref: '#/components/schemas/Ref' } }

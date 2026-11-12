@@ -1,0 +1,24 @@
+spring:
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/tracker}
+    username: tracker
+    password: tracker
+  mail:
+    host: localhost
+    port: 1025
+
+server:
+  servlet:
+    session:
+      cookie:
+        secure: false
+
+springdoc:
+  api-docs:
+    enabled: true
+  swagger-ui:
+    enabled: true
+    path: /swagger-ui.html
+
+tracker:
+  app-base-url: http://localhost:5173

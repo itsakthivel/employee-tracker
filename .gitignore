@@ -1,0 +1,22 @@
+# Java / Maven
+backend/target/
+*.class
+*.jar
+!backend/.mvn/wrapper/maven-wrapper.jar
+# Node
+frontend/node_modules/
+frontend/dist/
+frontend/test-results/
+frontend/playwright-report/
+# Env and logs
+.env
+.env.*
+*.log
+# OS / editors
+.DS_Store
+Thumbs.db
+*.tmp
+*.swp
+.vscode/
+.idea/
+frontend/*.tsbuildinfo
